@@ -289,12 +289,16 @@ def interactive(ctx, space_key, base_url, pat):
     stack: List[tuple[str, Optional[str], int, int]] = []  # (mode, arg, start, index)
     status_msg = ""
     header_title = ""
+    app_holder: Dict[str, Any] = {"app": None}  # <-- holds the Application instance after creation
 
     def status(txt: str):
         nonlocal status_msg
         status_msg = txt
         footer_control.text = [("class:footer", status_msg)]
-        app.invalidate()
+        # safe invalidate only if app is created
+        app = app_holder.get("app")
+        if app is not None:
+            app.invalidate()
 
     def goto_space(space: str):
         nonlocal current_space, arg, header_title, mode, start, index
@@ -541,6 +545,7 @@ def interactive(ctx, space_key, base_url, pat):
         status("Press 's' to select a space (loads its homepage).")
 
     app = Application(layout=layout, key_bindings=kb, style=style, full_screen=True)
+    app_holder["app"] = app  # <-- set the instance so status() can invalidate later
     result = app.run()
 
     # If the user pressed 'v', render the page in the terminal after leaving the TUI
