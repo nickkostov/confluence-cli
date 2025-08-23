@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "confluence-cli"
+version = "0.1.0"
+description = "CLI to convert Markdown to Confluence Storage and create/update pages"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Your Name" }]
+license = { text = "MIT" }
+dependencies = [
+  "click>=8.1",
+  "requests>=2.31",
+  "prompt-toolkit>=3.0",
+  "rich>=13.7",
+  "markdownify>=0.13",
+]
+
+[project.scripts]
+confluence = "src.cli:cli"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+packages = [
+  "src",
+  "src.commands",
+  "src.confluence",
+  "src.converters",
+  "src.utils",
+]
+
+[tool.ruff]
+line-length = 100
