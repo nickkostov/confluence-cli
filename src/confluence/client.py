@@ -60,16 +60,51 @@ class ConfluenceClient:
                 pass
             raise_for_status(resp.status_code, message=f"{method} {url}", payload=payload)
 
-    def page_link(self, page_json: dict) -> str:
-        """Build a direct link to the page from Confluence response."""
-        try:
-            webui = page_json.get("_links", {}).get("webui")
-            base = page_json.get("_links", {}).get("base")
-            if webui and base:
+    def page_link(self, page_json: dict) -> str | None:
+        """
+        Build a direct link to the page from Confluence response.
+        Works with Cloud and Server/DC APIs. Falls back to constructing from base_url + id.
+        """
+        if not page_json:
+            return None
+    
+        links = page_json.get("_links", {}) or {}
+        base_url = self.base_url.rstrip("/")
+    
+        # 1. Try base+webui (typical in responses)
+        webui = links.get("webui")
+        base = links.get("base")
+        if webui:
+            if base:
                 return f"{base}{webui}"
-        except Exception:
-            pass
-        return ""
+            if webui.startswith("/"):
+                return f"{base_url}{webui}"
+            return f"{base_url}/{webui}"
+    
+        # 2. Try tinyui (short link) if available
+        tinyui = links.get("tinyui")
+        if tinyui:
+            if tinyui.startswith("/"):
+                return f"{base_url}{tinyui}"
+            return f"{base_url}/{tinyui}"
+    
+        # 3. Construct manually from id + space
+        page_id = page_json.get("id")
+        space_key = None
+        space_obj = page_json.get("space")
+        if isinstance(space_obj, dict):
+            space_key = space_obj.get("key")
+    
+        if page_id:
+            if base_url.endswith("/wiki"):  # Atlassian Cloud
+                if space_key:
+                    return f"{base_url}/spaces/{space_key}/pages/{page_id}"
+                return f"{base_url}/pages/{page_id}"
+            else:  # Server / DC
+                return f"{base_url}/pages/{page_id}"
+    
+        return None
+
 
     # ---------------- space / homepage ----------------
     def get_space_homepage(self, space_key: str) -> Optional[str]:
