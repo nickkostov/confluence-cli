@@ -67,10 +67,10 @@ class ConfluenceClient:
         """
         if not page_json:
             return None
-    
+
         links = page_json.get("_links", {}) or {}
         base_url = self.base_url.rstrip("/")
-    
+
         # 1. Try base+webui (typical in responses)
         webui = links.get("webui")
         base = links.get("base")
@@ -80,21 +80,21 @@ class ConfluenceClient:
             if webui.startswith("/"):
                 return f"{base_url}{webui}"
             return f"{base_url}/{webui}"
-    
+
         # 2. Try tinyui (short link) if available
         tinyui = links.get("tinyui")
         if tinyui:
             if tinyui.startswith("/"):
                 return f"{base_url}{tinyui}"
             return f"{base_url}/{tinyui}"
-    
+
         # 3. Construct manually from id + space
         page_id = page_json.get("id")
         space_key = None
         space_obj = page_json.get("space")
         if isinstance(space_obj, dict):
             space_key = space_obj.get("key")
-    
+
         if page_id:
             if base_url.endswith("/wiki"):  # Atlassian Cloud
                 if space_key:
@@ -102,9 +102,8 @@ class ConfluenceClient:
                 return f"{base_url}/pages/{page_id}"
             else:  # Server / DC
                 return f"{base_url}/pages/{page_id}"
-    
-        return None
 
+        return None
 
     # ---------------- space / homepage ----------------
     def get_space_homepage(self, space_key: str) -> Optional[str]:
@@ -186,6 +185,69 @@ class ConfluenceClient:
                 if str(anc.get("id")) == str(parent_id):
                     return r
         return None
+
+    def update_page(
+        self,
+        *,
+        page_id: str,
+        body_html: str,
+        title: Optional[str] = None,
+        minor_edit: bool = True,
+        notify_watchers: bool = True,
+        _retry: bool = True,
+    ) -> dict:
+        """
+        Update a page's storage body (and optionally its title).
+        - Fetches current page to get type + current version.
+        - Increments version and PUTs to /rest/api/content/{id}.
+        - Retries once on version conflict (409).
+        """
+        # 1) Fetch current for type/title/version
+        current = self.get_page(page_id)
+        current_version = int((current.get("version") or {}).get("number", 0))
+        new_version = current_version + 1
+
+        payload: Dict[str, Any] = {
+            "id": str(page_id),
+            "type": current.get("type", "page"),
+            "title": title or current.get("title"),
+            "version": {
+                "number": new_version,
+                "minorEdit": bool(minor_edit),
+            },
+            "body": {
+                "storage": {
+                    "value": body_html,
+                    "representation": "storage",
+                }
+            },
+        }
+
+        try:
+            return self._request(
+                "PUT",
+                f"/rest/api/content/{page_id}",
+                params={"notifyWatchers": str(bool(notify_watchers)).lower()},
+                json=payload,
+                expected={200},
+            )
+        except Exception as e:
+            # If a concurrent edit happened, Confluence returns 409.
+            msg = str(e)
+            if _retry and "409" in msg:
+                if self.verbose:
+                    print("Version conflict (409). Refetching and retrying once...")
+                current = self.get_page(page_id)
+                current_version = int((current.get("version") or {}).get("number", 0))
+                payload["version"]["number"] = current_version + 1
+                return self._request(
+                    "PUT",
+                    f"/rest/api/content/{page_id}",
+                    params={"notifyWatchers": str(bool(notify_watchers)).lower()},
+                    json=payload,
+                    expected={200},
+                )
+            raise
 
     # ---------------- browsing helpers ----------------
     def list_pages_in_space(self, *, space_key: str, limit: int = 25, start: int = 0,

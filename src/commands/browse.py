@@ -9,13 +9,15 @@ import click
 from ..confluence.client import ConfluenceClient
 from ..utils.config import resolve_required, resolve_space_key
 from ..utils.log import info, warn
-from ..utils.render import html_to_markdown, render_markdown_paged
+from ..utils.render import html_to_markdown, render_markdown_paged  # used by `view` command
 
 # --- prompt_toolkit for interactive mode ---
 from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.containers import FloatContainer, Float, ConditionalContainer
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea, Frame
 from prompt_toolkit.shortcuts import input_dialog
@@ -247,7 +249,7 @@ def view_page(ctx, page_id: Optional[str], title: Optional[str], space_key: Opti
     render_markdown_paged(md, title=title_text or page_id)
 
 
-# ---------------- interactive mode (homepage-first + viewer) ----------------
+# ---------------- interactive mode (homepage-first + viewer overlay) ----------------
 
 @browse_group.command(name="interactive")
 @click.option('--space-key', envvar='CONFLUENCE_SPACE_KEY',
@@ -261,15 +263,16 @@ def interactive(ctx, space_key, base_url, pat):
       ↑/↓  Move selection
       →    Drill into children
       ←    Go back
+      ESC  Back / Close overlay
       Enter Open in browser
-      v    View in terminal (render)
+      v    View in-app overlay (markdown)
       /    Search (type and press Enter)
       s    Switch space (lands on the space HOMEPAGE)
       g    Go to page by ID
       n/p  Next/Prev page
       [ ]  Decrease/Increase page size
       r    Refresh
-      q    Quit
+      q    Quit (or close overlay if open)
     """
     cfg = ctx.obj.get("config", {})
     base_url = resolve_required("base_url", base_url, cfg)
@@ -290,6 +293,26 @@ def interactive(ctx, space_key, base_url, pat):
     status_msg = ""
     header_title = ""
     app_holder: Dict[str, Any] = {"app": None}  # <-- holds the Application instance after creation
+
+    # Overlay state
+    overlay = {"visible": False}
+    overlay_title = ""
+    overlay_text = TextArea(
+        text="",
+        style="",
+        read_only=True,
+        scrollbar=True,
+        wrap_lines=True,
+    )
+    overlay_frame = Frame(overlay_text, title=overlay_title)
+    overlay_help = TextArea(
+        text="ESC back • q close overlay",
+        style="class:help",
+        height=1,
+        read_only=True,
+    )
+    overlay_root = HSplit([overlay_help, overlay_frame])
+    overlay_visible = Condition(lambda: overlay["visible"])
 
     def status(txt: str):
         nonlocal status_msg
@@ -349,8 +372,9 @@ def interactive(ctx, space_key, base_url, pat):
 
     help_text = TextArea(
         text=(
-            "↑/↓ move • Enter open • v view • → children • ← back • / search • s space(homepage) • g goto id • "
-            "n/p next/prev • [ ] size • r refresh • q quit"
+            "↑/↓ move • Enter open • v view • → children • ← back • ESC back/close • "
+            "/ search • s space(homepage) • g goto id • "
+            "n/p next/prev • [ ] size • r refresh • q quit/close overlay"
         ),
         style="class:help",
         height=1,
@@ -360,8 +384,23 @@ def interactive(ctx, space_key, base_url, pat):
     footer_control = FormattedTextControl(text=[("class:footer", "")])
     footer_window = Window(content=footer_control, height=1)
 
-    root_container = HSplit([help_text, Frame(list_window, title="Confluence Browser"), footer_window])
-    layout = Layout(root_container)
+    main_container = HSplit([help_text, Frame(list_window, title="Confluence Browser"), footer_window])
+
+    # Wrap main container in a FloatContainer so we can overlay the viewer
+    root_with_overlay = FloatContainer(
+        content=main_container,
+        floats=[
+            # Fullscreen overlay by anchoring all sides to 0
+            Float(
+                content=ConditionalContainer(overlay_root, filter=overlay_visible),
+                left=0,
+                right=0,
+                top=0,
+                bottom=0,
+            ),
+        ],
+    )
+    layout = Layout(root_with_overlay)
 
     style = Style.from_dict({
         "selected": "reverse",
@@ -373,24 +412,46 @@ def interactive(ctx, space_key, base_url, pat):
 
     kb = KeyBindings()
 
+    def close_overlay(event):
+        nonlocal overlay_title
+        if overlay["visible"]:
+            overlay["visible"] = False
+            overlay_title = ""
+            overlay_frame.title = ""
+            event.app.layout.focus(list_window)
+            app = app_holder.get("app")
+            if app is not None:
+                app.invalidate()
+
     @kb.add("q")
     def _(event):
-        event.app.exit()
+        # If overlay is open, close it; otherwise quit
+        if overlay["visible"]:
+            close_overlay(event)
+        else:
+            event.app.exit()
 
     @kb.add("up")
     def _(event):
+        # Ignore list navigation while overlay is visible
+        if overlay["visible"]:
+            return
         nonlocal index
         if items:
             index = max(0, index - 1)
 
     @kb.add("down")
     def _(event):
+        if overlay["visible"]:
+            return
         nonlocal index
         if items:
             index = min(len(items) - 1, index + 1)
 
     @kb.add("enter")
     def _(event):
+        if overlay["visible"]:
+            return
         if not items:
             status("No item selected.")
             return
@@ -405,7 +466,7 @@ def interactive(ctx, space_key, base_url, pat):
 
     @kb.add("v")
     def _(event):
-        # View selected page in terminal
+        # Open in-app overlay viewer
         if not items:
             status("No item selected.")
             return
@@ -421,11 +482,21 @@ def interactive(ctx, space_key, base_url, pat):
         except Exception as e:
             status(f"View error: {e}")
             return
-        # Exit fullscreen and pass content back to caller to render with Rich pager
-        event.app.exit(result=("view", title, md))
+
+        nonlocal overlay_title
+        overlay_title = f"{title}  [id:{pid}]"
+        overlay_frame.title = overlay_title
+        overlay_text.text = md
+        overlay["visible"] = True
+        event.app.layout.focus(overlay_text)
+        app = app_holder.get("app")
+        if app is not None:
+            app.invalidate()
 
     @kb.add("right")
     def _(event):
+        if overlay["visible"]:
+            return
         nonlocal mode, arg, start, index, header_title
         if not items:
             return
@@ -438,6 +509,8 @@ def interactive(ctx, space_key, base_url, pat):
 
     @kb.add("left")
     def _(event):
+        if overlay["visible"]:
+            return
         nonlocal mode, arg, start, index, header_title
         if not stack:
             status("Top level")
@@ -448,56 +521,99 @@ def interactive(ctx, space_key, base_url, pat):
             header_title = f"{parent.get('title','')}  [id:{arg}]"
         load()
 
+    # ESC: close overlay if open; otherwise behave like ← (Back)
+    @kb.add("escape")
+    def _(event):
+        if overlay["visible"]:
+            close_overlay(event)
+            return
+        nonlocal mode, arg, start, index, header_title
+        if not stack:
+            status("Top level")
+            return
+        mode, arg, start, index = stack.pop()
+        if arg:
+            try:
+                parent = client.get_page(str(arg))
+                header_title = f"{parent.get('title','')}  [id:{arg}]"
+            except Exception:
+                header_title = f"[id:{arg}]"
+        load()
+
     @kb.add("/")
     def _(event):
-        # Search within current space (status=current).
-        nonlocal start, index
-        if not current_space:
-            status("Select a space first (press 's').")
+        if overlay["visible"]:
             return
-        q = input_dialog(title="Search", text="Enter query:").run()
-        if not q or not q.strip():
-            return
-        cql_parts = [f'text~"{q.strip()}"', "type=page", "status=current", f"space={current_space}"]
-        cql = " AND ".join(cql_parts) + " ORDER BY lastmodified DESC"
-        try:
-            results = client.search_cql(cql=cql, limit=page_size, start=0)
-        except Exception as e:
-            status(f"Search error: {e}")
-            return
-        nonlocal items
-        items = results or []
-        start = 0
-        index = 0
-        status(f"Search in {current_space}: '{q.strip()}' • {len(items)} items")
+
+        async def do_search():
+            nonlocal start, index, items
+            # Use async dialog inside running event loop
+            q = await input_dialog(title="Search", text="Enter query:").run_async()
+            if not q or not q.strip():
+                return
+            cql_parts = [f'text~"{q.strip()}"', "type=page", "status=current", f"space={current_space}"]
+            cql = " AND ".join(cql_parts) + " ORDER BY lastmodified DESC"
+            try:
+                results = client.search_cql(cql=cql, limit=page_size, start=0)
+            except Exception as e:
+                status(f"Search error: {e}")
+                return
+            items = results or []
+            start = 0
+            index = 0
+            status(f"Search in {current_space}: '{q.strip()}' • {len(items)} items")
+
+        event.app.create_background_task(do_search())
 
     @kb.add("s")
     def _(event):
-        sp = input_dialog(title="Space", text="Enter space key:").run()
-        if sp is None or sp.strip() == "":
+        if overlay["visible"]:
             return
-        stack.clear()
-        goto_space(sp.strip())
+
+        async def choose_space():
+            sp = await input_dialog(title="Space", text="Enter space key:").run_async()
+            if sp is None or sp.strip() == "":
+                return
+            stack.clear()
+            goto_space(sp.strip())
+
+        event.app.create_background_task(choose_space())
 
     @kb.add("g")
     def _(event):
-        pid = input_dialog(title="Go to Page ID", text="Enter page id:").run()
-        if not pid:
+        if overlay["visible"]:
             return
-        try:
-            page = client.get_page(pid)
-        except Exception as e:
-            status(f"Go to error: {e}")
-            return
-        nonlocal arg, start, index, header_title
-        arg = str(pid)
-        header_title = f"{page.get('title','')}  [id:{pid}]"
-        start = 0
-        index = 0
-        load()
+
+        async def go_to_id():
+            nonlocal arg, start, index, header_title
+            pid_raw = await input_dialog(title="Go to Page ID", text="Enter page id:").run_async()
+            if pid_raw is None:
+                return
+            pid = pid_raw.strip()
+            if not pid:
+                status("No ID provided.")
+                return
+            if not pid.isdigit():
+                status("Please enter a numeric page ID.")
+                return
+            try:
+                page = client.get_page(pid)
+            except Exception as e:
+                status(f"Go to error: {e}")
+                return
+            # Jump to that page's children
+            arg = pid
+            header_title = f"{page.get('title','')}  [id:{pid}]"
+            start = 0
+            index = 0
+            load()
+
+        event.app.create_background_task(go_to_id())
 
     @kb.add("n")
     def _(event):
+        if overlay["visible"]:
+            return
         nonlocal start, index
         start += page_size
         index = 0
@@ -505,6 +621,8 @@ def interactive(ctx, space_key, base_url, pat):
 
     @kb.add("p")
     def _(event):
+        if overlay["visible"]:
+            return
         nonlocal start, index
         start = max(0, start - page_size)
         index = 0
@@ -512,6 +630,8 @@ def interactive(ctx, space_key, base_url, pat):
 
     @kb.add("[")
     def _(event):
+        if overlay["visible"]:
+            return
         nonlocal page_size, start, index
         page_size = max(5, page_size - 5)
         start = 0
@@ -520,6 +640,8 @@ def interactive(ctx, space_key, base_url, pat):
 
     @kb.add("]")
     def _(event):
+        if overlay["visible"]:
+            return
         nonlocal page_size, start, index
         page_size = min(100, page_size + 5)
         start = 0
@@ -528,6 +650,8 @@ def interactive(ctx, space_key, base_url, pat):
 
     @kb.add("r")
     def _(event):
+        if overlay["visible"]:
+            return
         load()
 
     # initial view
@@ -547,11 +671,7 @@ def interactive(ctx, space_key, base_url, pat):
     app = Application(layout=layout, key_bindings=kb, style=style, full_screen=True)
     app_holder["app"] = app  # <-- set the instance so status() can invalidate later
     result = app.run()
-
-    # If the user pressed 'v', render the page in the terminal after leaving the TUI
-    if isinstance(result, tuple) and result and result[0] == "view":
-        _, title, md = result
-        render_markdown_paged(md, title=title)
+    # No external pager here; overlay is in-app, so we just exit when the user quits.
 
 
 # ---------------- helpers ----------------
